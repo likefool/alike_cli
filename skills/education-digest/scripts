@@ -1,0 +1,1128 @@
+#!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.9"
+# dependencies = [
+#     "aiohttp>=3.9.0",
+# ]
+# ///
+"""
+Education Daily Digest - AI-powered RSS digest from education feeds
+Fetches RSS feeds, scores articles with AI, and generates a Markdown digest.
+"""
+
+import asyncio
+import json
+import os
+import re
+import sys
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional, Dict, List, Set, Tuple
+from urllib.parse import urlparse
+import xml.etree.ElementTree as ET
+
+import aiohttp
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+OPENAI_DEFAULT_API_BASE = 'http://alike.ai:8000/v1'
+#OPENAI_DEFAULT_MODEL = 'Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-Q4_K_M'
+#OPENAI_DEFAULT_MODEL = 'qwen3.5-9b'
+OPENAI_DEFAULT_MODEL = 'gemma-4-26b'
+FEED_FETCH_TIMEOUT_MS = 15_000
+FEED_CONCURRENCY = 10
+BATCH_SIZE = 10
+MAX_CONCURRENT_REQUESTS = 2
+
+# 90 RSS feeds from Hacker News Popularity Contest 2025 (curated by Karpathy)
+RSS_FEEDS = [
+        {"name": "KQED RSS Feed", "xmlUrl": "https://ww2.kqed.org/mindshift/feed/", "htmlUrl": "https://www.kqed.org/mindshift/"},
+        {"name": "EdSurge RSS Feed", "xmlUrl": "https://www.edsurge.com/articles_rss", "htmlUrl": "https://www.edsurge.com/news"},
+        {"name": "The Hechinger Report RSS Feed", "xmlUrl": "https://hechingerreport.org/feed/", "htmlUrl": "https://hechingerreport.org/"},
+        {"name": "eSchool News RSS Feed", "xmlUrl": "http://www.eschoolnews.com/feed/", "htmlUrl": "https://www.eschoolnews.com/"},
+        {"name": "The New York Times RSS Feed", "xmlUrl": "https://www.nytimes.com/svc/collections/v1/publish/https://www.nytimes.com/section/learning/rss.xml", "htmlUrl": "https://www.nytimes.com/section/learning"},
+        {"name": "The Guardian's Teacher Network", "xmlUrl": "https://www.theguardian.com/teacher-network/rss", "htmlUrl": "https://www.theguardian.com/teacher-network"},
+        {"name": "EdSource", "xmlUrl": "https://edsource.org/feed/atom", "htmlUrl": "https://edsource.org/"},
+        {"name": "TeachThought", "xmlUrl": "http://www.teachthought.com/feed/", "htmlUrl": "https://www.teachthought.com/"},
+        {"name": "eLearning Industry", "xmlUrl": "http://feeds.feedburner.com/elearningindustry", "htmlUrl": "https://elearningindustry.com/articles"},
+    #{"name": "", "xmlUrl": "", "htmlUrl": ""},
+]
+
+# ============================================================================
+# Types & Data Classes
+# ============================================================================
+
+@dataclass
+class Article:
+    title: str
+    link: str
+    pub_date: datetime
+    description: str
+    source_name: str
+    source_url: str
+
+@dataclass
+class ScoreBreakdown:
+    educational_value: int
+    accessibility: int
+    relevance: int
+
+@dataclass
+class ScoredArticle(Article):
+    score: int
+    score_breakdown: ScoreBreakdown
+    category: str
+    keywords: List[str]
+    title_zh: str
+    summary: str
+    reason: str
+
+CATEGORY_META = {
+    'online-learning':    {'emoji': '🎓', 'label': 'Online Learning'},
+    'edtech-tools':       {'emoji': '🛠', 'label': 'EdTech Tools'},
+    'k12-education':      {'emoji': '📚', 'label': 'K-12 Education'},
+    'higher-education':   {'emoji': '🏫', 'label': 'Higher Education'},
+    'learning-science':   {'emoji': '🧠', 'label': 'Learning Science'},
+    'other':              {'emoji': '📝', 'label': 'Other'},
+}
+
+# ============================================================================
+# HTML/XML Utilities
+# ============================================================================
+
+def strip_html(html: str) -> str:
+    """Strip HTML tags and decode entities."""
+    text = html
+    text = re.sub(r'<[^>]*>', '', text)
+    text = text.replace('&amp;', '&')
+    text = text.replace('&lt;', '<')
+    text = text.replace('&gt;', '>')
+    text = text.replace('&quot;', '"')
+    text = text.replace('&#39;', "'")
+    text = text.replace('&nbsp;', ' ')
+    
+    text = re.sub(r'&#x([0-9a-fA-F]+);', lambda m: chr(int(m.group(1), 16)), text)
+    text = re.sub(r'&#(\d+);', lambda m: chr(int(m.group(1))), text)
+    
+    return text.strip()
+
+def extract_cdata(text: str) -> str:
+    """Extract CDATA content."""
+    match = re.search(r'<!\[CDATA\[([\s\S]*?)\]\]>', text)
+    return match.group(1) if match else text
+
+def get_tag_content(xml: str, tag_name: str) -> str:
+    """Extract tag content from XML."""
+    pattern = rf'<{tag_name}[^>]*>([\s\S]*?)</{tag_name}>'
+    match = re.search(pattern, xml, re.IGNORECASE)
+    if match:
+        return extract_cdata(match.group(1)).strip()
+    
+    self_closing_pattern = rf'<{tag_name}[^>]*/>'
+    if re.search(self_closing_pattern, xml, re.IGNORECASE):
+        return ''
+    
+    return ''
+
+def get_attr_value(xml: str, tag_name: str, attr_name: str) -> str:
+    """Extract attribute value from XML tag."""
+    pattern = rf'<{tag_name}[^>]*\s{attr_name}=["\']([^"\']*)["\'][^>]*/?>i'
+    match = re.search(pattern, xml, re.IGNORECASE)
+    return match.group(1) if match else ''
+
+def parse_date(date_str: str) -> Optional[datetime]:
+    """Parse date string to datetime."""
+    if not date_str:
+        return None
+    
+    try:
+        dt = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+        return dt
+    except (ValueError, AttributeError):
+        pass
+    
+    date_formats = [
+        '%a, %d %b %Y %H:%M:%S %z',
+        '%Y-%m-%dT%H:%M:%S%z',
+        '%Y-%m-%d %H:%M:%S',
+        '%Y-%m-%d',
+    ]
+    
+    for fmt in date_formats:
+        try:
+            return datetime.strptime(date_str, fmt)
+        except ValueError:
+            continue
+    
+    return None
+
+def parse_rss_items(xml: str) -> List[dict]:
+    """Parse RSS/Atom items from XML."""
+    items = []
+    
+    is_atom = '<feed' in xml and 'xmlns="http://www.w3.org/2005/Atom"' in xml
+    
+    if is_atom:
+        entry_pattern = r'<entry[\s>]([\s\S]*?)</entry>'
+        for match in re.finditer(entry_pattern, xml, re.IGNORECASE):
+            entry_xml = match.group(1)
+            title = strip_html(get_tag_content(entry_xml, 'title'))
+            
+            link = get_attr_value(entry_xml, 'link[^>]*rel="alternate"', 'href')
+            if not link:
+                link = get_attr_value(entry_xml, 'link', 'href')
+            
+            pub_date = get_tag_content(entry_xml, 'published') or get_tag_content(entry_xml, 'updated')
+            description = strip_html(get_tag_content(entry_xml, 'summary') or get_tag_content(entry_xml, 'content'))
+            
+            if title or link:
+                items.append({
+                    'title': title,
+                    'link': link,
+                    'pub_date': pub_date,
+                    'description': description[:500],
+                })
+    else:
+        item_pattern = r'<item[\s>]([\s\S]*?)</item>'
+        for match in re.finditer(item_pattern, xml, re.IGNORECASE):
+            item_xml = match.group(1)
+            title = strip_html(get_tag_content(item_xml, 'title'))
+            link = get_tag_content(item_xml, 'link') or get_tag_content(item_xml, 'guid')
+            pub_date = (get_tag_content(item_xml, 'pubDate') or 
+                       get_tag_content(item_xml, 'dc:date') or
+                       get_tag_content(item_xml, 'date'))
+            description = strip_html(
+                get_tag_content(item_xml, 'description') or 
+                get_tag_content(item_xml, 'content:encoded')
+            )
+            
+            if title or link:
+                items.append({
+                    'title': title,
+                    'link': link,
+                    'pub_date': pub_date,
+                    'description': description[:500],
+                })
+    
+    return items
+
+# ============================================================================
+# Feed Fetching
+# ============================================================================
+
+async def fetch_feed(session: aiohttp.ClientSession, feed: dict) -> List[Article]:
+    """Fetch and parse a single RSS feed."""
+    try:
+        timeout = aiohttp.ClientTimeout(total=FEED_FETCH_TIMEOUT_MS / 1000)
+        headers = {
+            'User-Agent': 'AI-Daily-Digest/1.0 (RSS Reader)',
+            'Accept': 'application/rss+xml, application/atom+xml, application/xml, text/xml, */*',
+        }
+        
+        async with session.get(feed['xmlUrl'], timeout=timeout, headers=headers) as response:
+            if response.status != 200:
+                raise Exception(f'HTTP {response.status}')
+            
+            xml = await response.text()
+            items = parse_rss_items(xml)
+            
+            articles = []
+            for item in items:
+                pub_date = parse_date(item['pub_date']) or datetime.fromtimestamp(0)
+                articles.append(Article(
+                    title=item['title'],
+                    link=item['link'],
+                    pub_date=pub_date,
+                    description=item['description'],
+                    source_name=feed['name'],
+                    source_url=feed['htmlUrl'],
+                ))
+            
+            return articles
+    except Exception as e:
+        msg = str(e)
+        if 'abort' not in msg.lower() and 'timeout' not in msg.lower():
+            print(f'[digest] ✗ {feed["name"]}: {msg}', file=sys.stderr)
+        return []
+
+async def fetch_all_feeds(feeds: List[dict]) -> List[Article]:
+    """Fetch all RSS feeds concurrently."""
+    all_articles = []
+    success_count = 0
+    fail_count = 0
+    
+    async with aiohttp.ClientSession() as session:
+        for i in range(0, len(feeds), FEED_CONCURRENCY):
+            batch = feeds[i:i + FEED_CONCURRENCY]
+            results = await asyncio.gather(*[fetch_feed(session, feed) for feed in batch], return_exceptions=True)
+            
+            for result in results:
+                if isinstance(result, list) and len(result) > 0:
+                    all_articles.extend(result)
+                    success_count += 1
+                else:
+                    fail_count += 1
+            
+            progress = min(i + FEED_CONCURRENCY, len(feeds))
+            print(f'[digest] Progress: {progress}/{len(feeds)} feeds processed ({success_count} ok, {fail_count} failed)')
+    
+    print(f'[digest] Fetched {len(all_articles)} articles from {success_count} feeds ({fail_count} failed)')
+    return all_articles
+
+# ============================================================================
+# AI Provider (OpenAI-compatible only)
+# ============================================================================
+
+async def call_openai(
+    prompt: str,
+    api_key: str,
+    api_base: str,
+    model: str
+) -> str:
+    """Call OpenAI-compatible API."""
+    normalized_base = api_base.rstrip('/')
+    url = f'{normalized_base}/chat/completions'
+    
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {api_key}',
+    }
+    
+    data = {
+        'model': model,
+        'messages': [{'role': 'user', 'content': prompt}],
+        'temperature': 0.3,
+        'top_p': 0.8,
+    }
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=data, headers=headers, timeout=aiohttp.ClientTimeout(total=600)) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    raise Exception(f'OpenAI API error ({response.status}): {error_text[:200]}')
+                
+                result = await response.json()
+                content = result.get('choices', [{}])[0].get('message', {}).get('content', '')
+                return content if isinstance(content, str) else ''
+    except Exception as e:
+        error_msg = str(e) if str(e) else f'Unknown error: {type(e).__name__}'
+        raise Exception(f'OpenAI call failed: {error_msg}') from e
+
+def infer_openai_model(api_base: str) -> str:
+    """Infer OpenAI model from API base URL."""
+    if 'deepseek' in api_base.lower():
+        return 'deepseek-chat'
+    return OPENAI_DEFAULT_MODEL
+
+class AIClient:
+    """OpenAI-compatible AI client."""
+    
+    def __init__(self, openai_key: str,
+                 openai_base: Optional[str] = None, openai_model: Optional[str] = None):
+        self.openai_key = openai_key
+        self.openai_base = (openai_base or OPENAI_DEFAULT_API_BASE).rstrip('/')
+        self.openai_model = openai_model or infer_openai_model(self.openai_base)
+    
+    async def call(self, prompt: str) -> str:
+        """Call OpenAI-compatible API."""
+        return await call_openai(prompt, self.openai_key, self.openai_base, self.openai_model)
+
+def parse_json_response(text: str) -> dict:
+    """Parse JSON response, handling markdown code blocks."""
+    json_text = text.strip()
+    if json_text.startswith('```'):
+        json_text = re.sub(r'^```(?:json)?\n?', '', json_text)
+        json_text = re.sub(r'\n?```$', '', json_text)
+    return json.loads(json_text)
+
+# ============================================================================
+# AI Scoring
+# ============================================================================
+
+def build_scoring_prompt(articles: List[Tuple[int, str, str, str]]) -> str:
+    """Build prompt for article scoring."""
+    articles_list = '\n\n---\n\n'.join([
+        f"Index {idx}: [{source}] {title}\n{desc[:300]}"
+        for idx, title, desc, source in articles
+    ])
+    
+    return f"""You are an education content curator selecting articles for a daily digest focused on education and learning.
+
+Please evaluate the following articles on three dimensions (1-10 integer scale, 10 being highest) and assign each article a category label and extract 2-4 keywords.
+
+## Scoring Dimensions
+
+### 1. Educational Value (educational_value) - How well does it support learning outcomes?
+- 10: Provides deep pedagogical insights, clear learning frameworks, or transformative teaching methods
+- 7-9: Contains practical teaching strategies or significant educational research findings
+- 4-6: Offers useful but not groundbreaking educational information
+- 1-3: Minimal educational value or unclear learning benefits
+
+### 2. Accessibility (accessibility) - How easy is it to understand and implement?
+- 10: Clear, well-structured, actionable for educators and learners at all levels
+- 7-9: Generally clear with good practical guidance
+- 4-6: Understandable but may require additional context or technical knowledge
+- 1-3: Complex, unclear, or difficult to implement
+
+### 3. Relevance (relevance) - How relevant is it to current education trends?
+- 10: Addresses urgent, emerging education challenges or breakthrough innovations
+- 7-9: Relevant to current educational priorities and trends
+- 4-6: Relevant to education but not particularly timely
+- 1-3: Outdated or tangential to education
+
+## Category Labels (must choose one)
+- online-learning: Online learning platforms, MOOCs, digital courses, remote education
+- edtech-tools: EdTech tools, software, applications, technology integration in education
+- k12-education: K-12 education, curriculum, teaching methods, student assessment
+- higher-education: Higher education, university research, academic innovation
+- learning-science: Learning science, cognitive psychology, educational research, brain-based learning
+- other: Other education-related content
+
+## Keyword Extraction
+Extract 2-4 keywords that best represent the article's topic (in English, concise, e.g., "online learning", "AI tutoring", "assessment")
+
+## Articles to Evaluate
+
+{articles_list}
+
+Return strictly in JSON format without markdown code blocks or additional text:
+{{
+  "results": [
+    {{
+      "index": 0,
+      "educational_value": 8,
+      "accessibility": 7,
+      "relevance": 9,
+      "category": "online-learning",
+      "keywords": ["online learning", "course design", "student engagement"]
+    }}
+  ]
+}}"""
+
+async def score_articles_with_ai(
+    articles: List[Article],
+    ai_client: AIClient
+) -> Dict[int, dict]:
+    """Score articles using AI."""
+    all_scores = {}
+    
+    indexed = [(i, a.title, a.description, a.source_name) for i, a in enumerate(articles)]
+    
+    batches = [indexed[i:i + BATCH_SIZE] for i in range(0, len(indexed), BATCH_SIZE)]
+    
+    print(f'[digest] AI scoring: {len(articles)} articles in {len(batches)} batches')
+    
+    valid_categories = {'online-learning', 'edtech-tools', 'k12-education', 'higher-education', 'learning-science', 'other'}
+    
+    for i in range(0, len(batches), MAX_CONCURRENT_REQUESTS):
+        batch_group = batches[i:i + MAX_CONCURRENT_REQUESTS]
+        tasks = []
+        
+        for batch in batch_group:
+            async def score_batch(b=batch):
+                try:
+                    prompt = build_scoring_prompt(b)
+                    response_text = await ai_client.call(prompt)
+                    parsed = parse_json_response(response_text)
+                    
+                    scores = {}
+                    for result in parsed.get('results', []):
+                        clamp = lambda v: max(1, min(10, round(v)))
+                        category = result.get('category', 'other')
+                        if category not in valid_categories:
+                            category = 'other'
+                        
+                        scores[result['index']] = {
+                            'educational_value': clamp(result.get('educational_value', 5)),
+                            'accessibility': clamp(result.get('accessibility', 5)),
+                            'relevance': clamp(result.get('relevance', 5)),
+                            'category': category,
+                            'keywords': result.get('keywords', [])[:4],
+                        }
+                    return scores
+                except Exception as e:
+                    error_msg = str(e)
+                    print(f'[digest] Scoring batch failed: {error_msg}', file=sys.stderr)
+                    return {item[0]: {'educational_value': 5, 'accessibility': 5, 'relevance': 5, 'category': 'other', 'keywords': []} for item in b}
+            
+            tasks.append(score_batch())
+        
+        results = await asyncio.gather(*tasks)
+        for score_dict in results:
+            all_scores.update(score_dict)
+        
+        print(f'[digest] Scoring progress: {min(i + MAX_CONCURRENT_REQUESTS, len(batches))}/{len(batches)} batches')
+    
+    return all_scores
+
+# ============================================================================
+# AI Summarization
+# ============================================================================
+
+def build_summary_prompt(articles: List[Tuple[int, str, str, str, str]], lang: str) -> str:
+    """Build prompt for article summarization."""
+    articles_list = '\n\n---\n\n'.join([
+        f"Index {idx}: [{source}] {title}\nURL: {link}\n{desc[:800]}"
+        for idx, title, desc, source, link in articles
+    ])
+    
+    if lang == 'zh':
+        lang_instruction = '請用中文撰寫摘要和推薦理由。如果原文是英文，請翻譯為中文。標題翻譯也用中文。'
+        template = f"""你是一個教育內容摘要專家。請為以下文章完成三件事：
+
+1. **中文標題** (titleZh): 將英文標題翻譯成自然的中文。如果原標題已經是中文則保持不變。
+2. **摘要** (summary): 4-6 句話的結構化摘要，讓讀者不點進原文也能了解核心內容。包含：
+   - 文章討論的核心教育問題或主題（1 句）
+   - 關鍵教育洞察、教學方法或研究發現（2-3 句）
+   - 結論或作者的核心觀點（1 句）
+3. **推薦理由** (reason): 1 句話說明「為什麼值得讀」，區別於摘要（摘要說「是什麼」，推薦理由說「為什麼」）。
+
+{lang_instruction}
+
+摘要要求：
+- 直接說重點，不要用「本文討論了...」、「這篇文章介紹了...」這種開頭
+- 包含具體的教育名詞、研究數據、教學方案或觀點
+- 保留關鍵數字和指標（如學習成果提升百分比、學生人數、研究數據等）
+- 如果文章涉及對比或教學方法選擇，要點出比較對象和結論
+- 目標：讀者花 30 秒讀完摘要，就能決定是否值得花 10 分鐘讀原文
+
+## 待摘要文章
+
+{articles_list}
+
+請嚴格按 JSON 格式返回：
+{{
+  "results": [
+    {{
+      "index": 0,
+      "titleZh": "中文翻譯的標題",
+      "summary": "摘要內容...",
+      "reason": "推薦理由..."
+    }}
+  ]
+}}"""
+    else:
+        lang_instruction = 'Write summaries, reasons, and title translations in English.'
+        template = f"""You are an education content summarization expert. Please complete three tasks for the following articles:
+
+1. **Title** (title): Translate or adapt the title to be clear and descriptive in English. If already in English, keep it concise.
+2. **Summary** (summary): A 4-6 sentence structured summary so readers can understand the core content without clicking the original link. Include:
+   - The core educational problem or topic (1 sentence)
+   - Key educational insights, methods, or findings (2-3 sentences)
+   - Conclusion or main takeaway (1 sentence)
+3. **Reason to Read** (reason): 1 sentence explaining "why this is worth reading" — different from the summary (summary says "what", reason says "why").
+
+{lang_instruction}
+
+Summary requirements:
+- Get straight to the point; avoid opening with "This article discusses..." or "The author introduces..."
+- Include specific educational terms, research findings, tool names, or insights
+- Preserve key numbers and metrics (e.g., learning outcome improvements, student numbers, statistical data)
+- For comparative studies or reviews, highlight the comparison and conclusion
+- Goal: Reader spends 30 seconds on the summary and decides if the 10-minute read is worthwhile
+
+## Articles to Summarize
+
+{articles_list}
+
+Return strictly in JSON format without markdown code blocks or additional text:
+{{
+  "results": [
+    {{
+      "index": 0,
+      "title": "Clear English title",
+      "summary": "4-6 sentence summary content...",
+      "reason": "Why read this article..."
+    }}
+  ]
+}}"""
+    
+    return template
+
+async def summarize_articles(
+    articles: List[Tuple[int, Article]],
+    ai_client: AIClient,
+    lang: str
+) -> Dict[int, dict]:
+    """Generate summaries for articles."""
+    summaries = {}
+    
+    indexed = [(idx, a.title, a.description, a.source_name, a.link) for idx, a in articles]
+    
+    batches = [indexed[i:i + BATCH_SIZE] for i in range(0, len(indexed), BATCH_SIZE)]
+    
+    print(f'[digest] Generating summaries for {len(articles)} articles in {len(batches)} batches')
+    
+    for i in range(0, len(batches), MAX_CONCURRENT_REQUESTS):
+        batch_group = batches[i:i + MAX_CONCURRENT_REQUESTS]
+        tasks = []
+        
+        for batch in batch_group:
+            async def summarize_batch(b=batch):
+                try:
+                    prompt = build_summary_prompt(b, lang)
+                    response_text = await ai_client.call(prompt)
+                    parsed = parse_json_response(response_text)
+                    
+                    batch_summaries = {}
+                    for result in parsed.get('results', []):
+                        batch_summaries[result['index']] = {
+                            'title_zh': result.get('titleZh', ''),
+                            'summary': result.get('summary', ''),
+                            'reason': result.get('reason', ''),
+                        }
+                    return batch_summaries
+                except Exception as e:
+                    error_msg = str(e)
+                    print(f'[digest] Summary batch failed: {error_msg}', file=sys.stderr)
+                    return {item[0]: {'title_zh': item[1], 'summary': item[1], 'reason': ''} for item in b}
+            
+            tasks.append(summarize_batch())
+        
+        results = await asyncio.gather(*tasks)
+        for summary_dict in results:
+            summaries.update(summary_dict)
+        
+        print(f'[digest] Summary progress: {min(i + MAX_CONCURRENT_REQUESTS, len(batches))}/{len(batches)} batches')
+    
+    return summaries
+
+# ============================================================================
+# AI Highlights
+# ============================================================================
+
+async def generate_highlights(
+    articles: List[ScoredArticle],
+    ai_client: AIClient,
+    lang: str
+) -> str:
+    """Generate today's highlights/trends."""
+    article_list = '\n'.join([
+        f"{i + 1}. [{a.category}] {a.title_zh or a.title} — {a.summary[:100]}"
+        for i, a in enumerate(articles[:10])
+    ])
+    
+    if lang == 'zh':
+        prompt = f"""根據以下今日精選教育文章列表，寫一段 3-5 句話的「今日看點」總結。
+要求：
+- 提煉出今天教育領域的 2-3 個主要趨勢、議題或創新
+- 不要逐篇列舉，要做巨觀歸納
+- 風格簡潔有力，像新聞導語
+- 用中文回答
+
+文章列表：
+{article_list}
+
+直接返回純文本總結，不要 JSON，不要 markdown 格式。"""
+    else:
+        prompt = f"""Based on the following selected education articles from today, write a 3-5 sentence summary of "Today's Highlights."
+
+Requirements:
+- Extract 2-3 major trends, issues, or innovations in the education field
+- Don't list articles one by one, provide a macro-level synthesis
+- Use a concise and compelling style, like a news lead
+- Write in English
+
+Article list:
+{article_list}
+
+Return only plain text summary, no JSON, no markdown format."""
+    
+    try:
+        return (await ai_client.call(prompt)).strip()
+    except Exception as e:
+        error_msg = str(e)
+        print(f'[digest] Highlights generation failed: {error_msg}', file=sys.stderr)
+        return ''
+
+# ============================================================================
+# Visualization
+# ============================================================================
+
+def humanize_time(pub_date: datetime) -> str:
+    """Convert datetime to human-readable relative time."""
+    now = datetime.now(pub_date.tzinfo) if pub_date.tzinfo else datetime.now()
+    diff = now - pub_date
+    
+    if diff.days == 0:
+        mins = diff.seconds // 60
+        if mins < 60:
+            return f'{mins} 分鐘前'
+        hours = diff.seconds // 3600
+        return f'{hours} 小時前'
+    
+    if diff.days < 7:
+        return f'{diff.days} 天前'
+    
+    return pub_date.strftime('%Y-%m-%d')
+
+def generate_keyword_bar_chart(articles: List[ScoredArticle]) -> str:
+    """Generate Mermaid keyword bar chart."""
+    kw_count = {}
+    for a in articles:
+        for kw in a.keywords:
+            normalized = kw.lower()
+            kw_count[normalized] = kw_count.get(normalized, 0) + 1
+    
+    sorted_kws = sorted(kw_count.items(), key=lambda x: x[1], reverse=True)[:12]
+    
+    if not sorted_kws:
+        return ''
+    
+    labels = ', '.join([f'"{k}"' for k, _ in sorted_kws])
+    values = ', '.join([str(v) for _, v in sorted_kws])
+    max_val = sorted_kws[0][1]
+    
+    chart = '```mermaid\n'
+    chart += 'xychart-beta horizontal\n'
+    chart += '    title "高頻關鍵詞"\n'
+    chart += f'    x-axis [{labels}]\n'
+    chart += f'    y-axis "出現次數" 0 --> {max_val + 2}\n'
+    chart += f'    bar [{values}]\n'
+    chart += '```\n'
+    
+    return chart
+
+def generate_category_pie_chart(articles: List[ScoredArticle]) -> str:
+    """Generate Mermaid category pie chart."""
+    cat_count = {}
+    for a in articles:
+        cat_count[a.category] = cat_count.get(a.category, 0) + 1
+    
+    if not cat_count:
+        return ''
+    
+    sorted_cats = sorted(cat_count.items(), key=lambda x: x[1], reverse=True)
+    
+    chart = '```mermaid\n'
+    chart += 'pie showData\n'
+    chart += '    title "文章分類分佈"\n'
+    for cat, count in sorted_cats:
+        meta = CATEGORY_META[cat]
+        chart += f'    "{meta["emoji"]} {meta["label"]}" : {count}\n'
+    chart += '```\n'
+    
+    return chart
+
+def generate_ascii_bar_chart(articles: List[ScoredArticle]) -> str:
+    """Generate ASCII keyword bar chart."""
+    kw_count = {}
+    for a in articles:
+        for kw in a.keywords:
+            normalized = kw.lower()
+            kw_count[normalized] = kw_count.get(normalized, 0) + 1
+    
+    sorted_kws = sorted(kw_count.items(), key=lambda x: x[1], reverse=True)[:10]
+    
+    if not sorted_kws:
+        return ''
+    
+    max_val = sorted_kws[0][1]
+    max_bar_width = 20
+    max_label_len = max(len(k) for k, _ in sorted_kws)
+    
+    chart = '```\n'
+    for label, value in sorted_kws:
+        bar_len = max(1, round((value / max_val) * max_bar_width))
+        bar = '█' * bar_len + '░' * (max_bar_width - bar_len)
+        chart += f'{label.ljust(max_label_len)} │ {bar} {value}\n'
+    chart += '```\n'
+    
+    return chart
+
+def generate_tag_cloud(articles: List[ScoredArticle]) -> str:
+    """Generate tag cloud."""
+    kw_count = {}
+    for a in articles:
+        for kw in a.keywords:
+            normalized = kw.lower()
+            kw_count[normalized] = kw_count.get(normalized, 0) + 1
+    
+    sorted_kws = sorted(kw_count.items(), key=lambda x: x[1], reverse=True)[:20]
+    
+    if not sorted_kws:
+        return ''
+    
+    return ' · '.join([
+        f'**{word}**({count})' if i < 3 else f'{word}({count})'
+        for i, (word, count) in enumerate(sorted_kws)
+    ])
+
+# ============================================================================
+# Report Generation
+# ============================================================================
+
+def generate_digest_report(
+    articles: List[ScoredArticle],
+    highlights: str,
+    stats: dict
+) -> str:
+    """Generate the final Markdown digest report."""
+    now = datetime.now()
+    date_str = now.strftime('%Y-%m-%d')
+    
+    report = f'# 📰 Edu Blog每日精選 — {date_str}\n\n'
+    report += f'> 來自 {stats["total_feeds"]} 個頂級 Edu Blog，AI 精選 Top {len(articles)}\n\n'
+    
+    if highlights:
+        report += '## 📝 今日看點\n\n'
+        report += f'{highlights}\n\n'
+        report += '---\n\n'
+    
+    if len(articles) >= 3:
+        report += '## 🏆 今日必讀\n\n'
+        medals = ['🥇', '🥈', '🥉']
+        for i in range(min(3, len(articles))):
+            a = articles[i]
+            medal = medals[i]
+            cat_meta = CATEGORY_META[a.category]
+            
+            report += f'{medal} **{a.title_zh or a.title}**\n\n'
+            report += f'[{a.title}]({a.link}) — {a.source_name} · {humanize_time(a.pub_date)} · {cat_meta["emoji"]} {cat_meta["label"]}\n\n'
+            report += f'> {a.summary}\n\n'
+            if a.reason:
+                report += f'💡 **為什麼值得讀**: {a.reason}\n\n'
+            if a.keywords:
+                report += f'🏷️ {", ".join(a.keywords)}\n\n'
+        
+        report += '---\n\n'
+    
+    report += '## 📊 資料概覽\n\n'
+    
+    report += '| 掃描源 | 抓取文章 | 時間範圍 | 精選 |\n'
+    report += '|:---:|:---:|:---:|:---:|\n'
+    report += f'| {stats["success_feeds"]}/{stats["total_feeds"]} | {stats["total_articles"]} 篇 → {stats["filtered_articles"]} 篇 | {stats["hours"]}h | **{len(articles)} 篇** |\n\n'
+    
+    pie_chart = generate_category_pie_chart(articles)
+    if pie_chart:
+        report += f'### 分類分佈\n\n{pie_chart}'
+    
+    bar_chart = generate_keyword_bar_chart(articles)
+    if bar_chart:
+        report += f'### 高頻關鍵詞\n\n{bar_chart}'
+    
+    ascii_chart = generate_ascii_bar_chart(articles)
+    if ascii_chart:
+        report += f'<details>\n<summary>📈 純文本關鍵詞圖（終端友善）</summary>\n\n{ascii_chart}</details>\n\n'
+    
+    tag_cloud = generate_tag_cloud(articles)
+    if tag_cloud:
+        report += f'### 🏷️ 話題標籤\n\n{tag_cloud}\n\n'
+    
+    report += '---\n\n'
+    
+    category_groups = {}
+    for a in articles:
+        if a.category not in category_groups:
+            category_groups[a.category] = []
+        category_groups[a.category].append(a)
+    
+    sorted_cats = sorted(category_groups.items(), key=lambda x: len(x[1]), reverse=True)
+    
+    global_index = 0
+    for cat_id, cat_articles in sorted_cats:
+        cat_meta = CATEGORY_META[cat_id]
+        report += f'## {cat_meta["emoji"]} {cat_meta["label"]}\n\n'
+        
+        for a in cat_articles:
+            global_index += 1
+            score_total = a.score_breakdown.educational_value + a.score_breakdown.accessibility + a.score_breakdown.relevance
+            
+            report += f'### {global_index}. {a.title_zh or a.title}\n\n'
+            report += f'[{a.title}]({a.link}) — **{a.source_name}** · {humanize_time(a.pub_date)} · ⭐ {score_total}/30\n\n'
+            report += f'> {a.summary}\n\n'
+            if a.keywords:
+                report += f'🏷️ {", ".join(a.keywords)}\n\n'
+            report += '---\n\n'
+    
+    report += f'*生成於 {date_str} {now.strftime("%H:%M")} | 掃描 {stats["success_feeds"]} 源 → 獲取 {stats["total_articles"]} 篇 → 精選 {len(articles)} 篇*\n'
+    report += '*由「AlikecoolAI」製作💡*\n'
+    
+    return report
+
+# ============================================================================
+# Data Persistence
+# ============================================================================
+
+def save_intermediate_data(data_dir: Path, name: str, data):
+    """Save intermediate data to JSON/JSONL file."""
+    data_dir.mkdir(parents=True, exist_ok=True)
+    
+    if isinstance(data, list):
+        # JSONL format for list of dicts
+        file_path = data_dir / f'{name}.jsonl'
+        with open(file_path, 'w', encoding='utf-8') as f:
+            for item in data:
+                f.write(json.dumps(item if isinstance(item, dict) else asdict(item), ensure_ascii=False) + '\n')
+        print(f'[digest] 💾 Saved {len(data)} records to {file_path}')
+    elif isinstance(data, dict):
+        # JSON format for dict
+        file_path = data_dir / f'{name}.json'
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        print(f'[digest] 💾 Saved to {file_path}')
+    else:
+        # Text format for strings
+        file_path = data_dir / f'{name}.txt'
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(str(data))
+        print(f'[digest] 💾 Saved to {file_path}')
+
+def save_scores_data(data_dir: Path, scores: Dict[int, dict], articles: List[Article]):
+    """Save AI scoring results with article info."""
+    records = []
+    for i, article in enumerate(articles):
+        score_info = scores.get(i, {'educational_value': 5, 'accessibility': 5, 'relevance': 5, 'category': 'other', 'keywords': []})
+        records.append({
+            'index': i,
+            'article_title': article.title,
+            'source': article.source_name,
+            'educational_value': score_info['educational_value'],
+            'accessibility': score_info['accessibility'],
+            'relevance': score_info['relevance'],
+            'total_score': score_info['educational_value'] + score_info['accessibility'] + score_info['relevance'],
+            'category': score_info['category'],
+            'keywords': score_info['keywords'],
+        })
+    save_intermediate_data(data_dir, 'scores', records)
+
+def save_summaries_data(data_dir: Path, summaries: Dict[int, dict], articles: List):
+    """Save AI summaries with article info."""
+    records = []
+    for i, (idx, article) in enumerate(articles):
+        sm = summaries.get(i, {'title_zh': article.title, 'summary': article.description[:200], 'reason': ''})
+        records.append({
+            'index': i,
+            'article_title_en': article.title,
+            'article_title_zh': sm['title_zh'],
+            'source': article.source_name,
+            'summary': sm['summary'],
+            'reason': sm['reason'],
+        })
+    save_intermediate_data(data_dir, 'summaries', records)
+
+# ============================================================================
+# CLI
+# ============================================================================
+
+def print_usage():
+    """Print help message."""
+    print("""Education Daily Digest - AI-powered RSS digest from education feeds
+
+Usage:
+  python scripts/digest.py [options]
+
+Options:
+  --hours <n>     Time range in hours (default: 48)
+  --top-n <n>     Number of top articles to include (default: 15)
+  --lang <lang>   Summary language: zh or en (default: zh)
+  --output <path> Output file path (default: ./digest-YYYYMMDD.md)
+  --help          Show this help
+
+Environment:
+  OPENAI_API_KEY   Required. API key for OpenAI or compatible API
+  OPENAI_API_BASE  Optional base URL (default: https://api.openai.com/v1)
+  OPENAI_MODEL     Optional model name (default: gpt-4o-mini, or deepseek-chat for DeepSeek)
+
+Examples:
+  python scripts/digest.py --hours 24 --top-n 10 --lang zh
+  python scripts/digest.py --hours 72 --top-n 20 --lang en --output ./my-digest.md
+""")
+    sys.exit(0)
+
+async def main():
+    """Main entry point."""
+    args = sys.argv[1:]
+    
+    if '--help' in args or '-h' in args:
+        print_usage()
+    
+    hours = 48
+    top_n = 15
+    lang = 'zh'
+    output_path = ''
+    
+    i = 0
+    while i < len(args):
+        if args[i] == '--hours' and i + 1 < len(args):
+            hours = int(args[i + 1])
+            i += 2
+        elif args[i] == '--top-n' and i + 1 < len(args):
+            top_n = int(args[i + 1])
+            i += 2
+        elif args[i] == '--lang' and i + 1 < len(args):
+            lang = args[i + 1]
+            i += 2
+        elif args[i] == '--output' and i + 1 < len(args):
+            output_path = args[i + 1]
+            i += 2
+        else:
+            i += 1
+    
+    openai_api_key = os.getenv('OPENAI_API_KEY')
+    openai_api_base = os.getenv('OPENAI_API_BASE')
+    openai_model = os.getenv('OPENAI_MODEL')
+    
+    if not openai_api_key:
+        print('[digest] Error: Missing API key. Set OPENAI_API_KEY.', file=sys.stderr)
+        print('[digest] Get API key from OpenAI, DeepSeek, or another OpenAI-compatible provider', file=sys.stderr)
+        sys.exit(1)
+    
+    ai_client = AIClient(
+        openai_key=openai_api_key,
+        openai_base=openai_api_base,
+        openai_model=openai_model,
+    )
+    
+    if not output_path:
+        date_str = datetime.now().strftime('%Y%m%d')
+        output_path = f'./digest-{date_str}.md'
+    
+    print('[digest] === Education Daily Digest ===')
+    print(f'[digest] Time range: {hours} hours')
+    print(f'[digest] Top N: {top_n}')
+    print(f'[digest] Language: {lang}')
+    print(f'[digest] Output: {output_path}')
+    resolved_base = (openai_api_base or OPENAI_DEFAULT_API_BASE).rstrip('/')
+    resolved_model = openai_model or infer_openai_model(resolved_base)
+    print(f'[digest] AI provider: {resolved_base} (model={resolved_model})')
+    print()
+    
+    print(f'[digest] Step 1/5: Fetching {len(RSS_FEEDS)} RSS feeds...')
+    all_articles = await fetch_all_feeds(RSS_FEEDS)
+    
+    if not all_articles:
+        print('[digest] Error: No articles fetched from any feed. Check network connection.', file=sys.stderr)
+        sys.exit(1)
+    
+    print(f'[digest] Step 2/5: Filtering by time range ({hours} hours)...')
+    cutoff_time = datetime.now() - timedelta(hours=hours)
+    recent_articles = []
+    for a in all_articles:
+        if a.pub_date:
+            pub_date = a.pub_date
+            # Remove timezone info for comparison
+            if pub_date.tzinfo is not None:
+                pub_date = pub_date.replace(tzinfo=None)
+            if pub_date > cutoff_time:
+                recent_articles.append(a)
+    
+    print(f'[digest] Found {len(recent_articles)} articles within last {hours} hours')
+    
+    if not recent_articles:
+        print(f'[digest] Error: No articles found within the last {hours} hours.', file=sys.stderr)
+        print(f'[digest] Try increasing --hours (e.g., --hours 168 for one week)', file=sys.stderr)
+        sys.exit(1)
+    
+    print(f'[digest] Step 3/5: AI scoring {len(recent_articles)} articles...')
+    scores = await score_articles_with_ai(recent_articles, ai_client)
+    
+    scored_articles = []
+    for i, article in enumerate(recent_articles):
+        score_info = scores.get(i, {'educational_value': 5, 'accessibility': 5, 'relevance': 5, 'category': 'other', 'keywords': []})
+        scored_articles.append({
+            'article': article,
+            'total_score': score_info['educational_value'] + score_info['accessibility'] + score_info['relevance'],
+            'breakdown': score_info,
+        })
+    
+    scored_articles.sort(key=lambda x: x['total_score'], reverse=True)
+    top_articles = scored_articles[:top_n]
+    
+    if top_articles:
+        print(f'[digest] Top {top_n} articles selected (score range: {top_articles[-1]["total_score"]} - {top_articles[0]["total_score"]})')
+    
+    # 💾 Save scoring results
+    output_dir = Path(output_path).parent / Path(output_path).stem
+    data_dir = output_dir / 'data'
+    save_scores_data(data_dir, scores, recent_articles)
+    
+    print('[digest] Step 4/5: Generating AI summaries...')
+    indexed_top = [(i, a['article']) for i, a in enumerate(top_articles)]
+    summaries = await summarize_articles(indexed_top, ai_client, lang)
+    
+    # 💾 Save summaries
+    save_summaries_data(data_dir, summaries, indexed_top)
+    
+    final_articles = []
+    for i, article_data in enumerate(top_articles):
+        a = article_data['article']
+        sm = summaries.get(i, {'title_zh': a.title, 'summary': a.description[:200], 'reason': ''})
+        
+        final_articles.append(ScoredArticle(
+            title=a.title,
+            link=a.link,
+            pub_date=a.pub_date,
+            description=a.description,
+            source_name=a.source_name,
+            source_url=a.source_url,
+            score=article_data['total_score'],
+            score_breakdown=ScoreBreakdown(
+                educational_value=article_data['breakdown']['educational_value'],
+                accessibility=article_data['breakdown']['accessibility'],
+                relevance=article_data['breakdown']['relevance'],
+            ),
+            category=article_data['breakdown']['category'],
+            keywords=article_data['breakdown']['keywords'],
+            title_zh=sm['title_zh'],
+            summary=sm['summary'],
+            reason=sm['reason'],
+        ))
+    
+    print('[digest] Step 5/5: Generating today\'s highlights...')
+    highlights = await generate_highlights(final_articles, ai_client, lang)
+    
+    # 💾 Save highlights
+    (data_dir / 'highlights.txt').parent.mkdir(parents=True, exist_ok=True)
+    (data_dir / 'highlights.txt').write_text(highlights, encoding='utf-8')
+    print(f'[digest] 💾 Saved highlights to {data_dir / "highlights.txt"}')
+    
+    successful_sources = set(a.source_name for a in all_articles)
+    
+    # 💾 Save metadata
+    metadata = {
+        'timestamp': datetime.now().isoformat(),
+        'hours': hours,
+        'top_n': top_n,
+        'language': lang,
+        'total_feeds': len(RSS_FEEDS),
+        'successful_feeds': len(successful_sources),
+        'total_articles': len(all_articles),
+        'filtered_articles': len(recent_articles),
+        'selected_articles': len(final_articles),
+        'ai_provider': resolved_base,
+        'ai_model': resolved_model,
+    }
+    save_intermediate_data(data_dir, 'metadata', metadata)
+    
+    report = generate_digest_report(final_articles, highlights, {
+        'total_feeds': len(RSS_FEEDS),
+        'success_feeds': len(successful_sources),
+        'total_articles': len(all_articles),
+        'filtered_articles': len(recent_articles),
+        'hours': hours,
+        'lang': lang,
+    })
+    
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(output_path).write_text(report, encoding='utf-8')
+    
+    print()
+    print('[digest] ✅ Done!')
+    print(f'[digest] 📁 Report: {output_path}')
+    print(f'[digest] 📊 Stats: {len(successful_sources)} sources → {len(all_articles)} articles → {len(recent_articles)} recent → {len(final_articles)} selected')
+    
+    if final_articles:
+        print()
+        print('[digest] 🏆 Top 3 Preview:')
+        for i in range(min(3, len(final_articles))):
+            a = final_articles[i]
+            print(f'  {i + 1}. {a.title_zh or a.title}')
+            print(f'     {a.summary[:80]}...')
+
+if __name__ == '__main__':
+    asyncio.run(main())
