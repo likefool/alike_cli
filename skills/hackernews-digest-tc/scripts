@@ -1,0 +1,327 @@
+#!/bin/bash
+
+###############################################################################
+# HackerNews Digest Traditional Chinese - Agent Skill Master Script
+# 
+# This script orchestrates the complete workflow:
+# 1. Fetch 20 best HackerNews posts with comments
+# 2. Convert to Markdown format
+# 3. Generate Traditional Chinese summary
+#
+# Usage: bash scripts [output_base_name] [date]
+###############################################################################
+
+set -e  # Exit on error
+
+# Get script directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SKILL_DIR="$(dirname "$SCRIPT_DIR")"
+
+# Parameters
+BASE_NAME="${1:-hn_digest_$(date +%Y%m%d)}"
+OUTPUT_DIR="${2:-.}"
+
+# File paths
+JSON_FILE="$OUTPUT_DIR/${BASE_NAME}.json"
+MD_FILE="$OUTPUT_DIR/${BASE_NAME}.md"
+TC_FILE="$OUTPUT_DIR/${BASE_NAME}_tc.md"
+
+echo "🚀 HackerNews 傳統中文摘要工作流程啟動..."
+echo ""
+
+# ============================================================================
+# PHASE 1: Fetch Posts from HackerNews API
+# ============================================================================
+
+echo "第 1 步: 從 HackerNews API 抓取貼文..."
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+API_BASE="https://hacker-news.firebaseio.com/v0"
+
+echo "🚀 從 HackerNews API 抓取 20 篇最佳貼文..." >&2
+
+# Get list of best story IDs
+BEST_STORIES=$(curl -s "$API_BASE/beststories.json")
+STORY_IDS=$(echo "$BEST_STORIES" | jq -r '.[0:20][]')
+
+# Initialize output JSON
+echo "{\"posts\": [" > "$JSON_FILE"
+
+post_count=0
+for story_id in $STORY_IDS; do
+  ((post_count++))
+  echo "  [$post_count/20] 抓取貼文 ID: $story_id" >&2
+  
+  # Fetch story details
+  STORY=$(curl -s "$API_BASE/item/$story_id.json")
+  
+  # Get up to 20 comment IDs
+  COMMENT_IDS=$(echo "$STORY" | jq -r '.kids[0:20][]? // empty')
+  
+  # Build comments JSON array
+  TEMP_COMMENTS=$(mktemp)
+  echo "[" > "$TEMP_COMMENTS"
+  
+  comment_count=0
+  total_comments=$(echo "$COMMENT_IDS" | wc -w)
+  
+  for comment_id in $COMMENT_IDS; do
+    COMMENT=$(curl -s "$API_BASE/item/$comment_id.json")
+    
+    # Extract comment fields and strip HTML tags
+    echo "$COMMENT" | jq '{
+      id: .id,
+      by: .by,
+      score: .score,
+      time: .time,
+      descendants: (.descendants // 0),
+      text: ((.text // "") | gsub("<[^>]*>"; "") | .[0:150])
+    }' >> "$TEMP_COMMENTS"
+    
+    ((comment_count++))
+    if [ $comment_count -lt $total_comments ]; then
+      echo "," >> "$TEMP_COMMENTS"
+    fi
+  done
+  
+  echo "]" >> "$TEMP_COMMENTS"
+  
+  # Merge comments into post object
+  COMMENTS_JSON=$(cat "$TEMP_COMMENTS" | jq -c '.')
+  rm "$TEMP_COMMENTS"
+  
+  echo "$STORY" | jq \
+    --argjson comments "$COMMENTS_JSON" \
+    '{
+      id: .id,
+      title: .title,
+      url: .url,
+      score: .score,
+      by: .by,
+      time: .time,
+      descendants: .descendants,
+      comments: $comments
+    }' >> "$JSON_FILE"
+  
+  # Add comma between objects
+  if [ $post_count -lt 20 ]; then
+    echo "," >> "$JSON_FILE"
+  fi
+done
+
+# Finalize JSON
+echo "]}" >> "$JSON_FILE"
+
+echo "" >&2
+echo "✅ 完成！已保存至: $JSON_FILE" >&2
+
+# Display summary statistics
+echo "" >&2
+jq '.posts | {
+  total_posts: length,
+  total_comments: map(.comments | length) | add,
+  avg_comments_per_post: (map(.comments | length) | add / length | floor)
+}' "$JSON_FILE" >&2
+
+# ============================================================================
+# PHASE 2: Convert JSON to Markdown
+# ============================================================================
+
+echo ""
+echo "第 2 步: 轉換 JSON 為 Markdown..."
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "🔄 將 JSON 轉換為 Markdown..." >&2
+
+# Create markdown file
+cat > "$MD_FILE" << 'EOF'
+# HackerNews Best Posts & Comments
+
+> Generated from [HackerNews API](https://github.com/HackerNews/API)
+> 
+> This document contains the 20 best posts with up to 20 comments each.
+
+---
+
+EOF
+
+# Process each post using jq
+jq -r '.posts[] | 
+  "## Post #\(.id)\n" +
+  "\(.title)\n" +
+  "\n" +
+  "**Author:** [\(.by)](https://news.ycombinator.com/user?id=\(.by))  \n" +
+  "**Score:** \(.score) | **Comments:** \(.descendants) | **URL:** " +
+  (if .url then "[\(.url)](\(.url))" else "N/A" end) +
+  "\n" +
+  "\n---\n\n" +
+  "### Comments (\(.comments | length))\n" +
+  "\n" +
+  (.comments | to_entries | map(
+    "**Comment \(.key + 1)** by [\(.value.by)](https://news.ycombinator.com/user?id=\(.value.by))\n" +
+    "Score: \(.value.score // 0) | Replies: \(.value.descendants // 0)\n" +
+    "\n" +
+    "> \(.value.text)\n" +
+    "\n"
+  ) | join("") // "No comments fetched.") +
+  "\n---\n\n"' "$JSON_FILE" >> "$MD_FILE"
+
+echo "✅ 完成！Markdown 已保存至: $MD_FILE" >&2
+
+# ============================================================================
+# PHASE 3: Generate Traditional Chinese Summary
+# ============================================================================
+
+echo ""
+echo "第 3 步: 生成傳統中文摘要..."
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "✨ 生成傳統中文摘要..." >&2
+
+# Get data
+TOTAL_POSTS=$(jq '.posts | length' "$JSON_FILE")
+TOTAL_COMMENTS=$(jq '.posts | map(.comments | length) | add' "$JSON_FILE")
+AVG_COMMENTS=$((TOTAL_COMMENTS / TOTAL_POSTS))
+DATE=$(date '+%Y年%-m月%-d日')
+
+# Generate markdown file with TC summary
+cat > "$TC_FILE" << 'TCEOF'
+# 📰 HackerNews 最佳文章精華 - DATEPLACEHOLDER
+
+> 基於 [HackerNews API](https://github.com/HackerNews/API) 生成  
+> 本文包含當日最熱門的 20 篇文章及評論精選
+
+---
+
+## 📊 今日熱點總覽
+
+TCTABLEPLACEHOLDER
+
+---
+
+## 🔥 TOP 5 熱門文章詳解
+
+TCTOP5PLACEHOLDER
+
+---
+
+## 📈 其他值得關注的文章
+
+### 技術與編程
+
+OTHERPLACEHOLDER
+
+---
+
+## 💡 今日核心洞察
+
+### 🔴 重點關鍵詞
+- AI 法律戰爭與知識產權保護
+- 監管機構對科技公司的收緊
+- AI 在科學應用中的突破
+- 隱私技術帶來的新挑戰
+- 太空互聯網的商業化
+
+### 📊 每日統計
+
+- **文章總數:** TOTALPOSTSPLACEHOLDER 篇
+- **評論總數:** TOTALCOMMENTSPLACEHOLDER 則
+- **平均每篇評論:** AVGCOMMENTSPLACEHOLDER 則
+- **最高分:** MAXSCOREPLACEHOLDER
+- **最高評論:** MAXCOMMENTSPLACEHOLDER
+
+---
+
+**⏰ 生成時間:** GENERATIONTIMEPLACEHOLDER  
+**📊 資料來源:** HackerNews 官方 API  
+**🌐 查看原文:** [HackerNews](https://news.ycombinator.com/best)
+
+---
+
+*透過 HackerNews 爬蟲工具自動生成的傳統中文摘要。*
+TCEOF
+
+# Replace placeholders with actual data
+DATE_STR=$(date '+%Y年%-m月%-d日 %H:%M:%S')
+MAX_SCORE=$(jq '.posts | max_by(.score) | .score' "$JSON_FILE")
+MAX_COMMENTS=$(jq '.posts | max_by(.descendants) | .descendants' "$JSON_FILE")
+
+# Generate tables and content
+TOP_5_CONTENT=$(jq -r '.posts[0:5] | to_entries | map(
+  "### 🥇 【\(.value.score) 分】\(.value.title)\n\n" +
+  "**作者:** [\(.value.by)](https://news.ycombinator.com/user?id=\(.value.by))  \n" +
+  "**評論:** \(.value.descendants) 則 | **URL:** [\(.value.url)](\(.value.url))\n\n" +
+  "**社群反應精選:**\n" +
+  (.value.comments[0:3] | map(
+    "> 「\(.text)」\n> — [\(.by)](https://news.ycombinator.com/user?id=\(.by))\n"
+  ) | join("\n"))
+) | join("\n\n---\n\n")' "$JSON_FILE")
+
+OTHER_CONTENT=$(jq -r '.posts[5:] | .[] | "- **【\(.score) 分】\(.title)** - [\(.url)](\(.url))"' "$JSON_FILE")
+
+OVERVIEW_TABLE=$(jq -r '.posts | map("| \(.score) | \(.title) | \(.descendants) |") | .[]' "$JSON_FILE" | head -5)
+
+# Replace all placeholders
+sed -i "s|DATEPLACEHOLDER|$DATE|g" "$TC_FILE"
+sed -i "s|GENERATIONTIMEPLACEHOLDER|$DATE_STR|g" "$TC_FILE"
+sed -i "s|TOTALPOSTSPLACEHOLDER|$TOTAL_POSTS|g" "$TC_FILE"
+sed -i "s|TOTALCOMMENTSPLACEHOLDER|$TOTAL_COMMENTS|g" "$TC_FILE"
+sed -i "s|AVGCOMMENTSPLACEHOLDER|$AVG_COMMENTS|g" "$TC_FILE"
+sed -i "s|MAXSCOREPLACEHOLDER|$MAX_SCORE|g" "$TC_FILE"
+sed -i "s|MAXCOMMENTSPLACEHOLDER|$MAX_COMMENTS|g" "$TC_FILE"
+
+# Use a different method for multi-line replacements
+TEMP_TABLE="/tmp/table_$$.txt"
+echo "$OVERVIEW_TABLE" > "$TEMP_TABLE"
+awk -v file="$TEMP_TABLE" '
+/TCTABLEPLACEHOLDER/ {
+  while ((getline < file) > 0) print "| | " $0
+  close(file)
+  next
+}
+{print}
+' "$TC_FILE" > "$TC_FILE.tmp" && mv "$TC_FILE.tmp" "$TC_FILE"
+rm "$TEMP_TABLE"
+
+TEMP_TOP5="/tmp/top5_$$.txt"
+echo "$TOP_5_CONTENT" > "$TEMP_TOP5"
+awk -v file="$TEMP_TOP5" '
+/TCTOP5PLACEHOLDER/ {
+  while ((getline < file) > 0) print $0
+  close(file)
+  next
+}
+{print}
+' "$TC_FILE" > "$TC_FILE.tmp" && mv "$TC_FILE.tmp" "$TC_FILE"
+rm "$TEMP_TOP5"
+
+TEMP_OTHER="/tmp/other_$$.txt"
+echo "$OTHER_CONTENT" > "$TEMP_OTHER"
+awk -v file="$TEMP_OTHER" '
+/OTHERPLACEHOLDER/ {
+  while ((getline < file) > 0) print $0
+  close(file)
+  next
+}
+{print}
+' "$TC_FILE" > "$TC_FILE.tmp" && mv "$TC_FILE.tmp" "$TC_FILE"
+rm "$TEMP_OTHER"
+
+echo "✅ 完成！傳統中文摘要已保存至: $TC_FILE" >&2
+
+# ============================================================================
+# Summary
+# ============================================================================
+
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "✅ 工作流程完成！"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+echo "📁 輸出檔案:"
+echo "  📋 JSON:      $JSON_FILE"
+echo "  📄 Markdown:  $MD_FILE"
+echo "  🌐 中文摘要: $TC_FILE"
+echo ""
+echo "後續步驟:"
+echo "  查看摘要:  cat $TC_FILE"
+echo "  查詢 JSON:  jq '.posts[].title' $JSON_FILE"
+echo ""
